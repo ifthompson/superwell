@@ -5,25 +5,32 @@ import pandas as pd
 import math 
 import os 
 
-os.chdir('C:/Users/fere556/Desktop/Superwell/superwell')
+inputs_path = os.path.join(os.getcwd(), 'inputs')
+
 output_path = 'outputs'
-output_name = 'superwell_python_test' # file name for output
+output_name = 'superwell_python_test'  # file name for output
 
 # load data 
-os.chdir('inputs')
-grid_df = pd.read_csv('inputs.csv')
-well_params = pd.read_csv('Well_Params.csv', index_col = 0)
-electricity_rates = pd.read_csv('GCAM_Electrical_Rates.csv', index_col = 0, header = None)
-W_lookup = pd.read_csv('Theis_well_function_table.csv', header = "infer") 
+grid_df = pd.read_csv(os.path.join(inputs_path, 'inputs.csv'), keep_default_na=False)
+well_params = pd.read_csv(os.path.join(inputs_path, 'Well_Params.csv'), index_col=0)
+electricity_rates = pd.read_csv(os.path.join(inputs_path, 'GCAM_Electrical_Rates.csv'), index_col='country')
+W_lookup = pd.read_csv(os.path.join(inputs_path, 'Theis_well_function_table.csv'), header="infer")
 lookup_idx = pd.Index(W_lookup.W)
-os.chdir('../')
 
 # define constants
+SECS_IN_DAY = 24 * 60 * 60
+
 # user defined 
-IRR_DEPTH = 0.30 # annual irrigation depth target (m)
+IRR_DEPTH = 0.30  # annual irrigation depth target (m)
 NUM_YEARS = 100  # maximum years of pumping
-DAYS = 100 # days pumping per year
-MAXIMUM_INITIAL_SAT_THICKNESS = 200 
+DAYS = 100  # days pumping per year
+MAXIMUM_INITIAL_SAT_THICKNESS = 200
+NUM_INTERFERENCE_WELLS = 2
+WELL_DEEPENING_DEPTH = 50  # m
+
+# screening criteria
+max_s_frac = 0.40  # max drawdown as % of sat thickness
+max_s_absolute = 80  # max drawdown in m
 
 # imported 
 ELECTRICITY_RATE =  well_params.Val['Energy_cost_rate'] # defualt electricity rate
@@ -35,47 +42,54 @@ MAINTENANCE_RATE = well_params.Val['Maintenance_factor']
 SPECIFIC_WEIGHT = well_params.Val['Specific_weight'] # specific weight of water 
 
 # convert electricity rate dictionary 
-electricity_rate_dict = {}
-for i in range(len(electricity_rates.iloc[:,0])):
-    country = electricity_rates.index[i]
-    electricity_rate_dict[country.rstrip()] = electricity_rates.iloc[i,0]
+electricity_rate_dict = electricity_rates.electricity_cost_dollar_per_KWh.to_dict()
     
 # filter by country, if desired
 country = 'United States'
 if country != 'all':
-    selected_grid_df = grid_df.where(grid_df.CNTRY_NAME[:] == country)
-    selected_grid_df = selected_grid_df.dropna(thresh = 4)
-    selected_grid_df = selected_grid_df.reset_index(drop = True)
+    grid_df = grid_df[grid_df.CNTRY_NAME == country]
 
-# define Theis function 
-# define Theis function 
+################ determine if grid cell is skipped ########################
+grid_df = grid_df[
+    (grid_df.Area >= 10**7) & # skip grid areas less than 10x10 km
+    (grid_df.Depth >= 1) &  # depth to water table should we at least 5 meters
+    (grid_df.Permeability >= -15) & # limit low permeability values
+    (grid_df.Porosity >= 0.05) # limit porosity to 5% voids at least
+]
+
+# correct aquifer thickness outliers, replace >1000m thickness with 1000m
+grid_df.Thickness.loc[grid_df.Thickness > 1000] = 1000
+
+grid_df = grid_df.reset_index(drop=True)  # so that it starts at 0
+
+
+# define Theis function
 def drawdown_theis(time, r, S, T, Q):
     u = r**2 * S/(4 * T * time)
-    
-    if u > 5.9: # for large u values, W will be insignificant and drawdown (s) will ~= 0 
-        W = 0
+
+    if u < 0.6:  # use approximation for small u values
+        W = -np.euler_gamma - math.log(u) + u - u**2/(2*2)
         
-    elif 5.9 > u and u > .6: # use W(u) lookup table for intermediate values where approximation is insufficient 
+    elif 0.6 <= u <= 5.9:  # use W(u) lookup table for intermediate values where approximation is insufficient
         lookup_idx = pd.Index(W_lookup.u)
-        lookup_loc = lookup_idx.get_loc(u, method = 'nearest')
+        lookup_loc = lookup_idx.get_loc(u, method='nearest')
         W = W_lookup.W[lookup_loc]
         
-    else: # use approximation for small u values 
-        W = -0.57721 - math.log(u) + u - u**2/(2*2)
-        
-    s = W * Q / (4 * 3.1416 * T)
+    else:  # for large u values, W will be insignificant and drawdown (s) will ~= 0
+        W = 0
+
+    s = W * Q / (4 * np.pi * T)
     
-    return(s, u)
+    return s
     
 # candidate well pumping rates (gallons per minute)
-Q_array_gpm = [10, 20, 30, 40, 50, 100, 150, 200, 250, 300, 350, 400, 500, 600, 700, 
-           800, 900, 1000, 1200, 1300, 1400, 1500]
+Q_array_gpm = [10, 20, 30, 40, 50, 100, 150, 200, 250, 300, 350, 400, 500, 600, 700, 800, 900, 1000, 1200, 1300, 1400, 1500]
 
-Q_array = np.zeros(len(Q_array_gpm))
-# convert candidate pumping rates to m^3/s
-for i, Q in enumerate(Q_array_gpm):
-    Q_array[i] = Q/(60*264.17)
+# TODO: intervals?
 
+Q_array = [i / (60 * 264.17) for i in Q_array_gpm]  # convert gpm to m^3/s
+
+# TODO: Hassan pick important variables, get rid of constants
 # header for output file 
 header_column_names = 'iteration,year_number,DEPLETION_LIMIT,continent,country_name,' \
         'gcam_basin_id,gcam_basin_name,well_id,grid_area,permeability,storativity,' \
@@ -88,73 +102,77 @@ header_column_names = 'iteration,year_number,DEPLETION_LIMIT,continent,country_n
         'power,energy,energy_cost_rate,energy_cost,total_cost_perwell,total_cost_allwells,' \
         'unit_cost,unit_cost_per_km3,unit_cost_per_acreft,whyclass,total_well_length'
 
-#%% superwell code block 
-for grid_cell in range(len(selected_grid_df.iloc[:,0])):
-    
-    print('Percent complete = ' + str(100 * (grid_cell)/len(selected_grid_df.iloc[:,0])))
+outputs_df = pd.DataFrame(columns=['well_id', 'year', 'total_thickness', 'depth_to_piez_surface', 'aqfr_sat_thickness',
+                                   'radius_of_influence', 'drawdown', 'drawdown_interference', 'total_head',
+                                   'well_yield', 'volume_produced_perwell', 'number_of_wells', 'depleted_vol_fraction'])
 
-    ################ determine if grid cell is skipped ########################
+#%% superwell code block 
+for grid_cell in grid_df.itertuples(name='GridCell'):
     
-    # skip grid areas less than 10x10 km
-    if selected_grid_df.Area[grid_cell] < 1*10**7:
-        continue
-    
-    # depth to water table should we at least 5 meters
-    if selected_grid_df.Depth[grid_cell] < 1:
-        continue
-    
-    # limit low permeability values
-    if selected_grid_df.Permeability[grid_cell] < -15: 
-        continue 
-    
-    # limit porosity to 5% voids at least
-    if selected_grid_df.Porosity[grid_cell] < 0.05: 
-        continue 
-    
-    # correct aquifer thickness outliers, replace >1000m thickness with 200m
-    if selected_grid_df.Thickness[grid_cell] > 1000:
-        selected_grid_df.Thickness[grid_cell] == 1000
-        
+    print('Percent complete = ' + str(100 * grid_cell.Index/len(grid_df)))  # TODO: progress bar package?
+
+    # initialize all yearly variables containers
+    DTW_array = np.zeros(NUM_YEARS)  # tracks depth to water for each year
+    sat_thickness_array = np.zeros(NUM_YEARS)
+    well_length_array = np.zeros(NUM_YEARS)
+    T_array = np.zeros(NUM_YEARS)  # tracks T for each year
+    Well_Q_array = np.zeros(NUM_YEARS)
+    well_roi_array = np.zeros(NUM_YEARS)
+    well_area_array = np.zeros(NUM_YEARS)
+    depleted_volume_fraction = np.zeros(NUM_YEARS)  # initialize
+    drawdown = np.zeros(NUM_YEARS)
+    drawdown_interference = np.zeros(NUM_YEARS)
+    total_head = np.zeros(NUM_YEARS)
+    volume_per_well = np.zeros(NUM_YEARS)
+    num_wells = np.zeros(NUM_YEARS)
+    volume_all_wells = np.zeros(NUM_YEARS)
+    cumulative_volume_per_well = np.zeros(NUM_YEARS)
+    cumulative_volume_all_wells = np.zeros(NUM_YEARS)
+
+    annual_capital_cost = np.zeros(NUM_YEARS)
+    maintenance_cost = np.zeros(NUM_YEARS)
+    well_installation_cost = np.zeros(NUM_YEARS)
+    nonenergy_cost = np.zeros(NUM_YEARS)
+    power = np.zeros(NUM_YEARS)
+    energy = np.zeros(NUM_YEARS)
+    energy_cost_rate = np.zeros(NUM_YEARS)
+    energy_cost = np.zeros(NUM_YEARS)
+    total_cost_per_well = np.zeros(NUM_YEARS)
+    total_cost_all_wells = np.zeros(NUM_YEARS)
+    unit_cost = np.zeros(NUM_YEARS)
+    unit_cost_per_km3 = np.zeros(NUM_YEARS)
+    unit_cost_per_acreft = np.zeros(NUM_YEARS)
+
     ################ store grid cell attributes for output ####################
     
-    ELECTRICITY_RATE = electricity_rate_dict[str(selected_grid_df.CNTRY_NAME[grid_cell])] 
-    
-    total_thickness = selected_grid_df.Thickness[grid_cell] # m 
-    grid_cell_area = selected_grid_df.Area[grid_cell]
-    
+    ELECTRICITY_RATE = electricity_rate_dict[grid_cell.CNTRY_NAME]
+
     # depth to water 
-    depth_to_peiz_surface = selected_grid_df.Depth[grid_cell] # m
-    DTW_array = np.zeros(NUM_YEARS) # tracks depth to water for each year 
-    DTW_array[0] = depth_to_peiz_surface # initial depth to water
+    DTW_array[0] = grid_cell.Depth  # initial depth to water
     
     # saturated thickness 
-    initial_sat_thickness = selected_grid_df.Thickness[grid_cell] - selected_grid_df.Depth[grid_cell] # m
-    
+    initial_sat_thickness = grid_cell.Thickness - grid_cell.Depth  # m
+
     if initial_sat_thickness > MAXIMUM_INITIAL_SAT_THICKNESS:
-        sat_thickness_array = np.zeros(NUM_YEARS)
-        sat_thickness_array[0] = MAXIMUM_INITIAL_SAT_THICKNESS # m
-        well_length_array = np.zeros(NUM_YEARS)
-        well_length_array[0] = sat_thickness_array[0] + DTW_array[0] # m
+        sat_thickness_array[0] = MAXIMUM_INITIAL_SAT_THICKNESS  # m
+        well_length_array[0] = sat_thickness_array[0] + DTW_array[0]  # m
     else:    
-        sat_thickness_array = np.zeros(NUM_YEARS)
-        sat_thickness_array[0] = initial_sat_thickness # m
-        well_length_array = np.zeros(NUM_YEARS)
-        well_length_array[0] = total_thickness # m
+        sat_thickness_array[0] = initial_sat_thickness  # m
+        well_length_array[0] = grid_cell.Thickness  # m
         
     # available volume
-    available_volume = initial_sat_thickness * grid_cell_area * selected_grid_df.Porosity[grid_cell]
+    available_volume = initial_sat_thickness * grid_cell.Area * grid_cell.Porosity
     
     # aquifer properties for Theis 
-    S = selected_grid_df.Porosity[grid_cell] # [-]
-    K = 10 ** selected_grid_df.Permeability[grid_cell] * 1e7 # m/s 
-    T = K * sat_thickness_array[0] # m/s
-    T_array = np.zeros(NUM_YEARS) # tracks T for each year 
-    T_array[0] = T # initial T
+    S = grid_cell.Porosity  # [-]
+    K = (10 ** grid_cell.Permeability) * 1e7  # m/s
+    T = K * sat_thickness_array[0]  # m/s
+    T_array[0] = T  # initial T
     
     # assign well unit cost based on WHY Class 
-    if selected_grid_df.WHYClass[grid_cell] == 10:    
+    if grid_cell.WHYClass == 10:
         well_unit_cost = well_params.Val['Well_Install_10']
-    elif selected_grid_df.WHYClass[grid_cell] == 20:
+    elif grid_cell.WHYClass == 20:
         well_unit_cost = well_params.Val['Well_Install_20']
     else:
         well_unit_cost = well_params.Val['Well_Install_30']
@@ -162,126 +180,92 @@ for grid_cell in range(len(selected_grid_df.iloc[:,0])):
     #################### determine initial well Q #############################
     
     # time and well radius for Theis solution
-    time_Q = 2 * 365 * 86400 # time period used for determining initial well Q
+    # TODO: why times 2?
+    time_Q = 2 * 365 * SECS_IN_DAY  # time period used for determining initial well Q
     well_r = 0.5 * well_params.Val['Well_Diameter']
     
-    # drawdown at t = 2 years for all candidate well Qs 
-    s_array = np.zeros(len(Q_array))
-    u_array = np.zeros(len(Q_array))
-    for i, Q in enumerate(Q_array):
-        s_array[i], u_array[i] = drawdown_theis(time_Q, well_r, S, T, Q)
-
     # find largest Q that meets screening criteria
-    # screening criteria 
-    max_s_frac = .40     # max drawdown as % of sat thickness
-    max_s_absolute = 80  # max drawdown in m
-    
-    Q_viability = np.zeros(len(Q_array))
-    
-    for i, s in enumerate(s_array):
+    initial_Q = None
+    for Q in reversed(Q_array):
+        s = drawdown_theis(time_Q, well_r, S, T, Q)  # drawdown at t = 2 years for candidate well
         if s/initial_sat_thickness < max_s_frac and s < max_s_absolute:
-            Q_viability[i] = 1
-    
+            initial_Q = Q
+            break
+
     # skip grid cell if no pumping rates are viable
-    if np.sum(Q_viability) == 0:
+    if initial_Q is None:
         continue
-    
-    initial_Q_indx_arr = np.where(Q_viability == 1) 
-    initial_Q_indx = np.max(initial_Q_indx_arr[:]) # index of largest viable Q
-    initial_Q = Q_array[initial_Q_indx]
-    Well_Q_array = np.zeros(NUM_YEARS)
-    Well_Q_array[0] = initial_Q 
+
+    Well_Q_array[0] = initial_Q
     
     ###################### determine initial well Area ########################
-    initial_well_area = initial_Q * 100 * 86400 / (IRR_DEPTH) # m^2
-    initial_roi = (initial_well_area/math.pi) ** 0.5 # m 
-    well_roi_array = np.zeros(NUM_YEARS)
+    initial_well_area = initial_Q * DAYS * SECS_IN_DAY / IRR_DEPTH  # m^2
+    initial_roi = np.sqrt(initial_well_area / np.pi)  # m
     well_roi_array[0] = initial_roi
-    well_area_array = np.zeros(NUM_YEARS)
     well_area_array[0] = initial_well_area
 
     ####################### annual pumping simulation loop ####################
-    depleted_volume_fraction = np.zeros(NUM_YEARS) # initialize 
-    
+
+    # TODO: restructure with grid cell class an run year method
     for year in range(NUM_YEARS):
         if depleted_volume_fraction[year-1] > DEPLETION_LIMIT:
             year = year - 1 
-            break 
+            break
             
         # test viability for current year (simulate drawdown at t = 100 days of pumping)
-        # initialize viability variables 
-        s_theis = 0 
-        u_theis = 0
-        s_theis_interference = 0 
-        u_theis_interference = 0
-        
-        s_theis, u_theis = drawdown_theis(DAYS * 86400, well_r, S, T_array[year], Well_Q_array[year])
-        s_theis_interference, u_theis_interference = drawdown_theis(DAYS * 86400, well_roi_array[year] * 2, S, T_array[year], Well_Q_array[year])
-        s_total = s_theis + 4 * s_theis_interference # total drawdown (well + interference)
+        s_theis = drawdown_theis(DAYS * SECS_IN_DAY, well_r, S, T_array[year], Well_Q_array[year])
+        s_theis_interference = drawdown_theis(DAYS * SECS_IN_DAY, well_roi_array[year] * NUM_INTERFERENCE_WELLS, S, T_array[year], Well_Q_array[year])
+        s_total = s_theis + 4 * s_theis_interference  # total drawdown (well + interference)
+        # TODO: question, relationship between NUM_INTERFERENCE_WELLS and "4"
         
         # check if drawdown constraints are violated by end of 100 day pumping period
         # if constraints violated: (1) first deepen well, (2) then reduce well pumping rate 
-        if s_total > max_s_absolute or s_total/sat_thickness_array[year] > max_s_frac:
+        if s_total/sat_thickness_array[year] > max_s_frac or s_total > max_s_absolute:
             
             # 1) first preference deepen well 
-            if well_length_array[year] < total_thickness:
-                # update well length
-                if well_length_array[year] + 50 < total_thickness:
-                    well_length_array[year] = 50 + well_length_array[year]
-                
-                else:
-                    remaining_length = total_thickness - well_length_array[year]
-                    well_length_array[year] = remaining_length + well_length_array[year]
-                    
+            if well_length_array[year] < grid_cell.Thickness:
+                # deepen well length by WELL_DEEPENING_DEPTH, but do not exceed aquifer thickness
+                well_length_array[year] = min(well_length_array[year] + WELL_DEEPENING_DEPTH, grid_cell.Thickness)
+
                 # update saturated thickness and T 
                 sat_thickness_array[year] = well_length_array[year] - DTW_array[year]
                 T_array[year] = sat_thickness_array[year] * K
                 
             # 2) once well cannot be deepened, reduce well pumping rate 
             else:
-                s_array = np.zeros(len(Q_array))
-                u_array = np.zeros(len(Q_array))
-                for i, Q in enumerate(Q_array):
-                    s_array[i], u_array[i] = drawdown_theis(time_Q, well_r, S, T_array[year], Q)
-            
-                Q_viability = np.zeros(len(Q_array))
-                
-                for i, s in enumerate(s_array):
-                    if s/sat_thickness_array[year] < max_s_frac and s < max_s_absolute:
-                        Q_viability[i] = 1
-                
-                #exit pumping code block if no pumping rates are viable 
-                if np.sum(Q_viability) == 0:
-                    break 
-                
-                Q_indx_arr = np.where(Q_viability == 1) 
-                Q_indx = np.max(Q_indx_arr[:]) # index of largest viable Q
-                new_Q = Q_array[Q_indx] # new Q 
-                Well_Q_array[year] = new_Q # update Q for current YEAR 
+
+                # TODO: put in function for reuse
+                # find largest Q that meets screening criteria
+                new_Q = None
+                for Q in reversed(Q_array):
+                    s = drawdown_theis(time_Q, well_r, S, T_array[year], Q)  # drawdown at t = 2 years for candidate well
+                    if s / initial_sat_thickness < max_s_frac and s < max_s_absolute:
+                        new_Q = Q
+                        break
+
+                # exit pumping code block if no pumping rates are viable
+                if new_Q is None:
+                    break
+
+                Well_Q_array[year] = new_Q  # update Q for current YEAR
                 
                 # update roi
-                well_area_array[year] = Well_Q_array[year] * 100 * 86400 / (IRR_DEPTH)
-                well_roi = (well_area_array[year] / math.pi) ** 0.5
-                well_roi_array[year] = initial_roi
-        
-        # # exit pumping code block if no pumping rates are viable
-        # if np.sum(Q_viability) == 0:
-        #     break 
+                well_area_array[year] = Well_Q_array[year] * DAYS * SECS_IN_DAY / IRR_DEPTH
+                well_roi = np.sqrt(well_area_array[year] / np.pi)
+                well_roi_array[year] = well_roi  # TODO: this was initial_roi, was it a bug?
            
         # if constraints aren't violated, proceed to calculate output for pumping year  
         # simulate 100 days of pumping, with drawdown calculated every 10 days
         s_theis_ts = np.zeros(int(DAYS/10)) 
-        u_theis_ts = np.zeros(int(DAYS/10)) 
         s_theis_interference_ts = np.zeros(int(DAYS/10))
-        u_theis_interference_ts = np.zeros(int(DAYS/10))
-        
+
         for day in range(int(DAYS/10)):
-            s_theis_ts[day], u_theis_ts[day] = drawdown_theis((day+1) * 10 * 86400, well_r, S, T_array[year], Well_Q_array[year])
-            s_theis_interference_ts[day], u_theis_interference_ts[day] = drawdown_theis((day+1) * 10 * 86400, well_roi_array[year] * 2, S, T_array[year], Well_Q_array[year])
+            s_theis_ts[day] = drawdown_theis((day+1) * 10 * SECS_IN_DAY, well_r, S, T_array[year], Well_Q_array[year])
+            s_theis_interference_ts[day] = drawdown_theis((day+1) * 10 * SECS_IN_DAY, well_roi_array[year] * 2, S, T_array[year], Well_Q_array[year])
         
         # average drawdown
-        s_theis_avg = np.mean(s_theis_ts) + np.mean(4* s_theis_interference_ts) 
-        s_interference_avg = 4 * np.mean(s_theis_interference_ts) 
+        s_theis_avg = np.mean(s_theis_ts) + np.mean(4 * s_theis_interference_ts)
+        s_interference_avg = 4 * np.mean(s_theis_interference_ts)
         
         # convert to Jacob - solve quadratic
         a = -1/(2*sat_thickness_array[year])
@@ -295,44 +279,21 @@ for grid_cell in range(len(selected_grid_df.iloc[:,0])):
         
         ########################### compute outputs ###########################
         
-        # save annual pumping values to arrays 
-        if year == 0:
-            drawdown = np.zeros(NUM_YEARS)
-            drawdown_interference = np.zeros(NUM_YEARS)
-            total_head = np.zeros(NUM_YEARS)
-            volume_per_well = np.zeros(NUM_YEARS)
-            num_wells = np.zeros(NUM_YEARS)
-            volume_all_wells = np.zeros(NUM_YEARS)
-            cumulative_volume_per_well = np.zeros(NUM_YEARS)
-            cumulative_volume_all_wells = np.zeros(NUM_YEARS)
-            depleted_volume_fraction = np.zeros(NUM_YEARS)
-            
-            drawdown[year] = s_jacob
-            drawdown_interference[year] = s_interference_avg
-            total_head[year] = s_jacob + DTW_array[year]
-            volume_per_well[year] = Well_Q_array[year] * 86400 * DAYS
-            num_wells[year] = selected_grid_df.Area[grid_cell]/well_area_array[year]
-            volume_all_wells[year] = volume_per_well[year] * num_wells[year]
-            cumulative_volume_per_well[year] = volume_per_well[year]
-            cumulative_volume_all_wells[year] =  volume_all_wells[year]
-            depleted_volume_fraction[year] = cumulative_volume_all_wells[year]/available_volume
-            
-        else:
-            drawdown[year] = s_jacob
-            drawdown_interference[year] = s_interference_avg
-            total_head[year] = s_jacob + DTW_array[year]
-            volume_per_well[year] = Well_Q_array[year] * 86400 * DAYS
-            num_wells[year] = selected_grid_df.Area[grid_cell]/well_area_array[year]
-            volume_all_wells[year] = volume_per_well[year] * num_wells[year]
-            cumulative_volume_per_well[year] = volume_per_well[year] + cumulative_volume_per_well[year-1]
-            cumulative_volume_all_wells[year] =  volume_all_wells[year] +  cumulative_volume_all_wells[year-1]
-            depleted_volume_fraction[year] = cumulative_volume_all_wells[year]/available_volume
+        # save annual pumping values to arrays
+        drawdown[year] = s_jacob
+        drawdown_interference[year] = s_interference_avg
+        total_head[year] = s_jacob + DTW_array[year]
+        volume_per_well[year] = Well_Q_array[year] * SECS_IN_DAY * DAYS
+        num_wells[year] = grid_cell.Area/well_area_array[year]
+        volume_all_wells[year] = volume_per_well[year] * num_wells[year]
+        cumulative_volume_per_well[year] = volume_per_well[year] + cumulative_volume_per_well[year-1]
+        cumulative_volume_all_wells[year] = volume_all_wells[year] + cumulative_volume_all_wells[year-1]
+        depleted_volume_fraction[year] = cumulative_volume_all_wells[year]/available_volume
 
-        
         # update variable arrays for next annual pumping iteration
         if year != NUM_YEARS-1:
             Well_Q_array[year+1] = Well_Q_array[year]
-            DTW_array[year+1] = DTW_array[year] + (volume_all_wells[year]/grid_cell_area)/S
+            DTW_array[year+1] = DTW_array[year] + (volume_all_wells[year]/grid_cell.Area)/S
             sat_thickness_array[year+1] = well_length_array[year] - DTW_array[year+1]
             T_array[year+1] = K * sat_thickness_array[year+1]
             well_roi_array[year+1] = well_roi_array[year]
@@ -418,19 +379,7 @@ for grid_cell in range(len(selected_grid_df.iloc[:,0])):
         
                     
     ####################### annual cost metrics ###########################
-    annual_capital_cost = np.zeros(NUM_YEARS)
-    maintenance_cost = np.zeros(NUM_YEARS)
-    well_installation_cost = np.zeros(NUM_YEARS)
-    nonenergy_cost = np.zeros(NUM_YEARS)
-    power = np.zeros(NUM_YEARS)
-    energy = np.zeros(NUM_YEARS)
-    energy_cost_rate = np.zeros(NUM_YEARS)
-    energy_cost = np.zeros(NUM_YEARS)
-    total_cost_per_well = np.zeros(NUM_YEARS)
-    total_cost_all_wells = np.zeros(NUM_YEARS)
-    unit_cost = np.zeros(NUM_YEARS)
-    unit_cost_per_km3 = np.zeros(NUM_YEARS)
-    unit_cost_per_acreft = np.zeros(NUM_YEARS)
+
     
     annual_capital_cost = np.sum(capital_cost_array, axis = 0)
     maintenance_cost = np.sum(maintenance_array, axis = 0)
@@ -448,6 +397,21 @@ for grid_cell in range(len(selected_grid_df.iloc[:,0])):
         unit_cost[year] = total_cost_all_wells[year]/volume_all_wells[year] # $/m^3
         unit_cost_per_km3[year] = unit_cost[year] * 10**9 # $/km^3
         unit_cost_per_acreft[year] = unit_cost[year] * 1233.48 # $/acft
+
+        gridcell_year = dict(
+            well_id=f'{grid_cell.Continent}{grid_cell.OBJECTID}',
+            year=year,
+            depth_to_piez_surface=DTW_array[year],
+            aqfr_sat_thickness=sat_thickness_array[year],
+            radius_of_influence=well_roi_array[year],
+            drawdown=drawdown[year],
+            drawdown_interference=drawdown_interference[year],  # might remove
+            total_head=total_head[year],  # might remove
+            well_yield=Well_Q_array[year],
+            volume_per_well=volume_per_well[year],
+            number_of_wells=num_wells[year],  # TODO: make file header name and variable names the same
+            depleted_volume_fraction=depleted_volume_fraction[year]
+        )
             
     ######################## save grid cell results ###########################
     """
@@ -467,15 +431,15 @@ for grid_cell in range(len(selected_grid_df.iloc[:,0])):
         outputs = str(1) + ', ' + \
                   str(year+1) + ', ' + \
                   str(DEPLETION_LIMIT) + ', ' + \
-                  str(selected_grid_df.Continent[grid_cell]) + ', ' + \
-                  str(selected_grid_df.CNTRY_NAME[grid_cell]) + ', ' + \
-                  str(int(selected_grid_df.GCAM_ID[grid_cell])) + ', ' + \
-                  str(selected_grid_df.Basin_Name[grid_cell]) + ', ' + \
-                  str(selected_grid_df.OBJECTID[grid_cell]) + ', ' + \
-                  str(grid_cell_area) + ', ' + \
-                  str(selected_grid_df.Permeability[grid_cell]) + ', ' + \
-                  str(selected_grid_df.Porosity[grid_cell]) + ', ' + \
-                  str(selected_grid_df.Thickness[grid_cell]) + ', ' + \
+                  str(grid_cell.Continent) + ', ' + \
+                  str(grid_cell.CNTRY_NAME) + ', ' + \
+                  str(int(grid_cell.GCAM_ID)) + ', ' + \
+                  str(grid_cell.Basin_Name) + ', ' + \
+                  str(grid_cell.OBJECTID) + ', ' + \
+                  str(grid_cell.Area) + ', ' + \
+                  str(grid_cell.Permeability) + ', ' + \
+                  str(grid_cell.Porosity) + ', ' + \
+                  str(grid_cell.Thickness) + ', ' + \
                   str(DTW_array[year]) + ', ' + \
                   str(initial_sat_thickness) + ', ' + \
                   str(sat_thickness_array[year]) + ', ' + \
@@ -508,10 +472,10 @@ for grid_cell in range(len(selected_grid_df.iloc[:,0])):
                   str(unit_cost[year]) + ', ' + \
                   str(unit_cost_per_km3[year]) + ', ' + \
                   str(unit_cost_per_acreft[year]) + ', ' + \
-                  str(selected_grid_df.WHYClass[grid_cell]) + ', ' + \
-                  str(selected_grid_df.Thickness[grid_cell]) 
+                  str(grid_cell.WHYClass) + ', ' + \
+                  str(grid_cell.Thickness)
                     
-        if grid_cell == 0 and year == 0 :
+        if grid_cell.Index == 0 and year == 0 :
             file = open(output_path + "\\" + output_name + '.csv', 'w') 
             file.write(str(header_column_names))
             file.write('\n')
@@ -535,7 +499,7 @@ first_year_unit_cost = first_year_unit_cost.dropna(thresh = 5)
 
 import matplotlib.pyplot as plt 
 
-plt.scatter(first_year_unit_cost.hydraulic_conductivity * 86400, first_year_unit_cost.unit_cost_per_acreft)
+plt.scatter(first_year_unit_cost.hydraulic_conductivity * SECS_IN_DAY, first_year_unit_cost.unit_cost_per_acreft)
 plt.xscale('log')
 plt.yscale('log')
 plt.xlabel('Aquifer K (m/d)')
