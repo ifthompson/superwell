@@ -3,7 +3,7 @@
 import numpy as np 
 import pandas as pd 
 import math 
-import os 
+import os
 
 inputs_path = os.path.join(os.getcwd(), 'inputs')
 
@@ -40,7 +40,10 @@ EFFICIENCY = well_params.Val['Pump_Efficiency'] # well efficiency
 WELL_LIFETIME = well_params.Val['Max_Lifetime_in_Years']
 INTEREST_RATE = well_params.Val['Interest_Rate']
 MAINTENANCE_RATE = well_params.Val['Maintenance_factor']
-SPECIFIC_WEIGHT = well_params.Val['Specific_weight'] # specific weight of water 
+SPECIFIC_WEIGHT = well_params.Val['Specific_weight'] # specific weight of water
+
+#INTEREST_MULTIPLIER = ((1 + INTEREST_RATE) ** WELL_LIFETIME) * INTEREST_RATE/((1 + INTEREST_RATE) ** WELL_LIFETIME-1)
+INTEREST_MULTIPLIER = (1 + INTEREST_RATE) * INTEREST_RATE  # equivalent expression?
 
 # convert electricity rate dictionary 
 electricity_rate_dict = electricity_rates.electricity_cost_dollar_per_KWh.to_dict()
@@ -152,7 +155,8 @@ for grid_cell in grid_df.itertuples(name='GridCell'):
         df.well_length[0] = grid_cell.Thickness  # m
         
     # available volume
-    available_volume = initial_sat_thickness * grid_cell.Area * grid_cell.Porosity
+    initial_available_volume = initial_sat_thickness * grid_cell.Area * grid_cell.Porosity
+    available_volume = initial_available_volume
     
     # aquifer properties for Theis 
     S = grid_cell.Porosity  # [-]
@@ -160,13 +164,8 @@ for grid_cell in grid_df.itertuples(name='GridCell'):
     T = K * df.sat_thickness[0]  # m/s
     df['T'][0] = T  # initial T  # pandas interprets df.T as the transpose of df, so we need df['T'] to get column T
     
-    # assign well unit cost based on WHY Class 
-    if grid_cell.WHYClass == 10:
-        well_unit_cost = well_params.Val['Well_Install_10']
-    elif grid_cell.WHYClass == 20:
-        well_unit_cost = well_params.Val['Well_Install_20']
-    else:
-        well_unit_cost = well_params.Val['Well_Install_30']
+    # assign well unit cost based on WHY Class
+    well_unit_cost = well_params.Val[f'Well_Install_{grid_cell.WHYClass}']
     
     #################### determine initial well Q #############################
     
@@ -188,8 +187,8 @@ for grid_cell in grid_df.itertuples(name='GridCell'):
     ####################### annual pumping simulation loop ####################
 
     for year in range(NUM_YEARS):
-        if df.depleted_volume_fraction[year-1] > DEPLETION_LIMIT:
-            year = year - 1 
+        if available_volume / initial_available_volume > DEPLETION_LIMIT:
+            year = year - 1
             break
             
         # test viability for current year (simulate drawdown at t = 100 days of pumping)
@@ -232,18 +231,14 @@ for grid_cell in grid_df.itertuples(name='GridCell'):
         # save annual pumping values to arrays
         df.drawdown[year] = s_jacob
         df.drawdown_interference[year] = s_interference_avg
-        df.total_head[year] = s_jacob + df.DTW[year]
-        df.volume_per_well[year] = df.Well_Q[year] * SECS_IN_DAY * DAYS
-        df.num_wells[year] = grid_cell.Area / df.well_area[year]
-        df.volume_all_wells[year] = df.volume_per_well[year] * df.num_wells[year]
-        df.cumulative_volume_per_well[year] = df.volume_per_well[year] + df.cumulative_volume_per_well[year-1]
-        df.cumulative_volume_all_wells[year] = df.volume_all_wells[year] + df.cumulative_volume_all_wells[year-1]
-        df.depleted_volume_fraction[year] = df.cumulative_volume_all_wells[year] / available_volume
+
+        volume_all_wells = df.Well_Q[year] * SECS_IN_DAY * DAYS * (grid_cell.Area / df.well_area[year])
+        available_volume -= volume_all_wells
 
         # update variable arrays for next annual pumping iteration
         if year != NUM_YEARS-1:
             df.Well_Q[year+1] = df.Well_Q[year]
-            df.DTW[year+1] = df.DTW[year] + (df.volume_all_wells[year]/grid_cell.Area)/S
+            df.DTW[year+1] = df.DTW[year] + (volume_all_wells / grid_cell.Area) / S
             df.sat_thickness[year+1] = df.well_length[year] - df.DTW[year+1]
             df['T'][year+1] = K * df.sat_thickness[year+1]
             df.well_roi[year+1] = df.well_roi[year]
@@ -269,25 +264,18 @@ for grid_cell in grid_df.itertuples(name='GridCell'):
     Q_vals = np.unique(df.Well_Q)
     if min(Q_vals) == 0:
         Q_vals = np.delete(Q_vals, 0)
-    Q_vals = np.sort(Q_vals)    
-    Q_vals = Q_vals[::-1]
         
-    Start_indx = np.zeros(len(Q_vals)) # indexes where pumping rate and well num changes 
-    if len(Start_indx) == 1:
-        pass
-    
-    else:
-        for i in range(pumping_years):
-            if i == 0:
-                counter = 1
-                continue 
-            if df.num_wells[i] - df.num_wells[i-1] > 0:
-                Start_indx[counter] = int(i)
+    Start_indx = np.zeros(len(Q_vals)) # indexes where pumping rate and well num changes
+    if len(Start_indx) != 1:
+        counter = 1
+        for i in range(1, pumping_years):
+            if df.Well_Q[i] > df.Well_Q[i-1]:  # moved num_wells calculation later
+                Start_indx[counter] = i
                 counter += 1 
     
     # initialize cost arrays to track annual non-energy costs for each group of added wells 
-    capital_cost_array = np.zeros((len(Start_indx), int(NUM_YEARS + WELL_LIFETIME)))
-    maintenance_array = np.zeros((len(Start_indx), int(NUM_YEARS + WELL_LIFETIME)))
+    capital_cost_array = np.zeros((len(Start_indx), NUM_YEARS))
+    maintenance_array = np.zeros((len(Start_indx), NUM_YEARS))
             
     # 1) no deepening, initial_sat_thickness < MAXIMUM_INITIAL_SAT_THICKNESS
     if initial_sat_thickness < MAXIMUM_INITIAL_SAT_THICKNESS:
@@ -295,44 +283,49 @@ for grid_cell in grid_df.itertuples(name='GridCell'):
         for added_wells in range(len(added_well_count)):
             offset = int(Start_indx[added_wells]) 
             for year in range(pumping_years):
-                capital_cost_array[added_wells, year + offset] = added_well_count[added_wells] * install_cost * ((1 + INTEREST_RATE) ** WELL_LIFETIME) * INTEREST_RATE/((1 + INTEREST_RATE) ** WELL_LIFETIME-1)
-                maintenance_array[added_wells, year + offset] = MAINTENANCE_RATE * install_cost * added_well_count[added_wells] # maintenance cost [% of initial cost]
+                yo = year + offset
+                capital_cost_array[added_wells, yo] = added_well_count[added_wells] * install_cost * INTEREST_MULTIPLIER
+                maintenance_array[added_wells, yo] = MAINTENANCE_RATE * install_cost * added_well_count[added_wells] # maintenance cost [% of initial cost]
 
     # 2) deepening, initial_sat_thickness > MAXIMUM_INITIAL_SAT_THICKNESS
     else:
         for added_wells in range(len(added_well_count)):
-            offset = int(Start_indx[added_wells]) 
-            for year in range(pumping_years):
-                if year + offset == pumping_years:
-                    break
-                
-                elif year == 0: 
-                    install_cost = well_unit_cost * df.well_length[0] 
-                    capital_cost_array[added_wells, year + offset] = added_well_count[added_wells] * install_cost * ((1 + INTEREST_RATE) ** WELL_LIFETIME) * INTEREST_RATE/((1 + INTEREST_RATE) ** WELL_LIFETIME-1)
-                    maintenance_array[added_wells, year + offset] = MAINTENANCE_RATE * install_cost * added_well_count[added_wells] # maintenance cost [% of initial cost]
-                    
-                elif (year+1)/WELL_LIFETIME == 0: # Replace well every n years (well lifetime), if reduced yeild, cheaper unit cost at 200 gpm and below
-                        
-                    install_cost = well_unit_cost * df.well_length[year + offset]
-                    capital_cost_array[added_wells, year + offset] += added_well_count[added_wells] * install_cost * ((1 + INTEREST_RATE) ** WELL_LIFETIME) * INTEREST_RATE/((1 + INTEREST_RATE) ** WELL_LIFETIME-1)
-                    maintenance_array[added_wells, year + offset] += MAINTENANCE_RATE * install_cost * added_well_count[added_wells] # maintenance cost [% of initial cost]
-            
-                elif df.well_length[year + offset] - df.well_length[year - 1 + offset] > 0:
-                    capital_cost_array[added_wells, year + offset] += added_well_count[added_wells] * install_cost * ((1 + INTEREST_RATE) ** WELL_LIFETIME) * INTEREST_RATE/((1 + INTEREST_RATE) ** WELL_LIFETIME-1)
-                    capital_cost_array[added_wells, (year + offset): int((year + offset + WELL_LIFETIME))] += well_unit_cost * (df.well_length[year + offset] - df.well_length[year - 1 + offset]) * ((1 + INTEREST_RATE) ** WELL_LIFETIME) * INTEREST_RATE/((1 + INTEREST_RATE) ** WELL_LIFETIME-1) * added_well_count[added_wells]
-                    install_cost = well_unit_cost * df.well_length[year + offset]
-                    maintenance_array[added_wells, year + offset] += MAINTENANCE_RATE * install_cost * added_well_count[added_wells]
-                    
+            offset = int(Start_indx[added_wells])
+            install_cost = well_unit_cost * df.well_length[0]
+            capital_cost_array[added_wells, offset] = added_well_count[added_wells] * install_cost * INTEREST_MULTIPLIER
+            maintenance_array[added_wells, offset] = MAINTENANCE_RATE * install_cost * added_well_count[added_wells]  # maintenance cost [% of initial cost]
+            for year in range(1, pumping_years-offset):
+                yo = year + offset
+
+                if (year+1) % WELL_LIFETIME == 0: # Replace well every n years (well lifetime), if reduced yeild, cheaper unit cost at 200 gpm and below
+                    install_cost = well_unit_cost * df.well_length[yo]
+                    capital_cost_array[added_wells, yo] += added_well_count[added_wells] * install_cost * INTEREST_MULTIPLIER
+
+                elif df.well_length[yo] > df.well_length[yo - 1]:
+                    capital_cost_array[added_wells, yo] += added_well_count[added_wells] * install_cost * INTEREST_MULTIPLIER
+                    capital_cost_array[added_wells, yo: yo + WELL_LIFETIME] += well_unit_cost * (df.well_length[yo] - df.well_length[yo - 1]) * INTEREST_MULTIPLIER * added_well_count[added_wells]
+                    install_cost = well_unit_cost * df.well_length[yo]
+
                 else:
-                    capital_cost_array[added_wells, year + offset] += added_well_count[added_wells] * install_cost * ((1 + INTEREST_RATE) ** WELL_LIFETIME) * INTEREST_RATE/((1 + INTEREST_RATE) ** WELL_LIFETIME-1)
-                    maintenance_array[added_wells, year + offset] += MAINTENANCE_RATE * install_cost * added_well_count[added_wells] # maintenance cost [% of initial cost]
+                    capital_cost_array[added_wells, yo] += added_well_count[added_wells] * install_cost * INTEREST_MULTIPLIER
+
+                maintenance_array[added_wells, yo] += MAINTENANCE_RATE * install_cost * added_well_count[added_wells]  # maintenance cost [% of initial cost]
                     
     ####################### annual cost metrics ###########################
+
+    # compute derived columns
+
+    df.total_head = df.drawdown + df.DTW
+    df.volume_per_well = df.Well_Q * SECS_IN_DAY * DAYS
+    df.num_wells = grid_cell.Area / df.well_area
+    df.volume_all_wells = df.volume_per_well * df.num_wells
+    df.cumulative_volume_per_well = df.volume_per_well.cumsum()
+    df.cumulative_volume_all_wells = df.volume_all_wells.cumsum()
+    df.depleted_volume_fraction = df.cumulative_volume_all_wells / initial_available_volume
 
     df['annual_capital_cost'] = np.sum(capital_cost_array, axis=0)
     df['maintenance_cost'] = np.sum(maintenance_array, axis=0)
 
-    # compute derived columns
     df.well_installation_cost = well_unit_cost * df.well_length
     df.nonenergy_cost = df.annual_capital_cost + df.maintenance_cost
     df.power = df.num_wells * (SPECIFIC_WEIGHT * df.total_head * df.Well_Q / EFFICIENCY) / 1000  # kW
