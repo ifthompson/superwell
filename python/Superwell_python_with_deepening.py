@@ -88,6 +88,31 @@ def get_pumping_rate(time, r, S, T, Q_candidates):
         if s / initial_sat_thickness < max_s_frac and s < max_s_absolute:
             return Q
     return 0
+
+
+def simulate_pumping(r, roi, S, T, Q, sat_thickness, days=100, timestep=10):
+    s_theis_ts = []
+    s_theis_interference_ts = []
+
+    for day in range(timestep, days + 1, timestep):
+        s_theis_ts.append(drawdown_theis(day * SECS_IN_DAY, r, S, T, Q))
+        s_theis_interference_ts.append(drawdown_theis(day * SECS_IN_DAY, roi * 2, S, T, Q))
+
+    # average drawdown
+    s_interference_avg = 4 * np.mean(s_theis_interference_ts)
+    s_theis_avg = np.mean(s_theis_ts) + s_interference_avg
+
+    # convert to Jacob - solve quadratic
+    a = -1 / (2 * sat_thickness)
+    b = 1
+    c = -s_theis_avg
+
+    s_jacob = (-b + (b ** 2 - 4 * a * c) ** 0.5) / (2 * a)
+    # s_jacob = (1 - np.sqrt(1 - 2 * s_theis_avg / sat_thickness)) * sat_thickness  # ?
+    #root_2 = (-b - (b ** 2 - 4 * a * c) ** 0.5) / (2 * a)
+
+    return s_jacob, s_interference_avg
+
     
 # candidate well pumping rates (gallons per minute)
 Q_array_gpm = [10, 20, 30, 40, 50, 100, 150, 200, 250, 300, 350, 400, 500, 600, 700, 800, 900, 1000, 1200, 1300, 1400, 1500]
@@ -200,27 +225,8 @@ for grid_cell in grid_df.itertuples(name='GridCell'):
            
         # if constraints aren't violated, proceed to calculate output for pumping year  
         # simulate 100 days of pumping, with drawdown calculated every 10 days
-        s_theis_ts = np.zeros(int(DAYS/10)) 
-        s_theis_interference_ts = np.zeros(int(DAYS/10))
+        s_jacob, s_interference_avg = simulate_pumping(well_r, df.well_roi[year], S, T, df.Well_Q[year], df.sat_thickness[year])
 
-        for day in range(int(DAYS/10)):
-            s_theis_ts[day] = drawdown_theis((day+1) * 10 * SECS_IN_DAY, well_r, S, df['T'][year], df.Well_Q[year])
-            s_theis_interference_ts[day] = drawdown_theis((day+1) * 10 * SECS_IN_DAY, df.well_roi[year] * 2, S, df['T'][year], df.Well_Q[year])
-        
-        # average drawdown
-        s_theis_avg = np.mean(s_theis_ts) + np.mean(4 * s_theis_interference_ts)
-        s_interference_avg = 4 * np.mean(s_theis_interference_ts)
-        
-        # convert to Jacob - solve quadratic
-        a = -1/(2*df.sat_thickness[year])
-        b = 1
-        c = -s_theis_avg
-        
-        root_1 = (-b + (b**2 - 4 * a * c) ** 0.5)/(2*a) 
-        root_2 = (-b - (b**2 - 4 * a * c) ** 0.5)/(2*a) 
-        
-        s_jacob = root_1
-        
         ########################### compute outputs ###########################
         
         # save annual pumping values to arrays
